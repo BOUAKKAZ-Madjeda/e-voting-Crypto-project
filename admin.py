@@ -2,140 +2,268 @@
 =============================================================
   admin.py — The Administrator
 =============================================================
-  HOW IT WORKS:
-    - Generates RSA 2048-bit key pair ONCE
-    - Saves keys to admin_keys.json
-    - Public key → shared with everyone
-    - Private key → used to sign ballots blindly
-    - Signs ballots WITHOUT seeing the real vote
+  Uses RSA with small parameters from the project:
+    N = 55   (= 5 × 11)
+    e = 27   (public key)
+    d = 3    (private key, because 27×3 = 81 ≡ 1 mod 40)
+    φ(N) = (5-1)(11-1) = 40
+
+  BLIND SIGNATURE PROTOCOL (Exercise 1 & 2):
+  
+    VOTER side:
+      1. Choose k coprime with N  (masking factor)
+      2. Compute m' = vote * k^e mod N  (mask the vote)
+      3. Send m' to admin  (admin sees m', NOT the vote!)
+      4. Receive m'' from admin
+      5. Compute s = m'' * k^(-1) mod N  (unmask)
+      6. Verify: s^e mod N == vote  ✅
+    
+    ADMIN side:
+      1. Receive m'  (just a number, cannot see the vote)
+      2. Compute m'' = (m')^d mod N  (sign blindly)
+      3. Return m'' to voter
 =============================================================
 """
-import json
-import os
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from math import gcd
 
 
-KEY_FILE = "admin_keys.json"
+# ── RSA Parameters (from Exercise 2) ──────────────────────
+N = 55    # RSA modulus = 5 × 11
+e = 27    # public key exponent
+d = 3     # private key  (27 × 3 mod 40 = 1)
+
+# Proof that d=3 is correct:
+# φ(55) = (5-1)(11-1) = 40
+# 27 × 3 = 81 = 2×40 + 1 ≡ 1 (mod 40) ✅
 
 
-def generate_and_save_keys():
-    """Generate RSA 2048-bit keys and save to file."""
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048
-    )
-    public_key = private_key.public_key()
+# ══════════════════════════════════════════════════════════
+#   RSA CORE FUNCTIONS
+# ══════════════════════════════════════════════════════════
 
-    pub_pem  = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode()
+def mod_inverse(k: int, n: int) -> int:
+    """
+    Compute modular inverse of k mod n.
+    Finds x such that k*x ≡ 1 (mod n).
+    Uses Extended Euclidean Algorithm.
+    """
+    if gcd(k, n) != 1:
+        raise ValueError(f"k={k} is not coprime with N={n}!")
 
-    priv_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode()
+    # Extended Euclidean Algorithm
+    old_r, r = k, n
+    old_s, s = 1, 0
 
-    with open(KEY_FILE, "w") as f:
-        json.dump({"public_key": pub_pem, "private_key": priv_pem}, f, indent=4)
+    while r != 0:
+        q = old_r // r
+        old_r, r = r, old_r - q * r
+        old_s, s = s, old_s - q * s
 
-    print(f"[ADMIN] ✅ RSA 2048-bit keys generated and saved to '{KEY_FILE}'")
-    print(f"[ADMIN] 🔑 Public key saved — share admin_keys.json with the team")
-
-
-def load_keys():
-    if not os.path.exists(KEY_FILE):
-        return None, None
-    with open(KEY_FILE, "r") as f:
-        data = json.load(f)
-    private_key = serialization.load_pem_private_key(
-        data["private_key"].encode(), password=None
-    )
-    public_key = serialization.load_pem_public_key(
-        data["public_key"].encode()
-    )
-    return private_key, public_key
+    result = old_s % n
+    return result
 
 
-def sign_ballot(ballot_str: str) -> str:
-    """Sign a ballot string. Returns hex signature."""
-    private_key, _ = load_keys()
-    if not private_key:
-        print("[ADMIN] ❌ Keys not found. Run option 1 first.")
-        return ""
-    signature = private_key.sign(
-        ballot_str.encode(),
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH
-        ),
-        hashes.SHA256()
-    )
-    return signature.hex()
+def get_valid_k_values() -> list:
+    """
+    Return all valid masking factors k (coprime with N, 2 ≤ k ≤ N-1).
+    Voter picks one of these randomly.
+    """
+    return [k for k in range(2, N) if gcd(k, N) == 1]
 
 
-def verify_signature(ballot_str: str, signature_hex: str) -> bool:
-    """Verify a ballot signature. Called by counter.py."""
-    _, public_key = load_keys()
-    if not public_key:
-        return False
-    try:
-        public_key.verify(
-            bytes.fromhex(signature_hex),
-            ballot_str.encode(),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return True
-    except Exception:
-        return False
+# ══════════════════════════════════════════════════════════
+#   VOTER SIDE — Masking and Unmasking
+# ══════════════════════════════════════════════════════════
+
+def mask_vote(vote: int, k: int) -> int:
+    """
+    VOTER: Mask the vote before sending to admin.
+    
+    Formula: m' = vote * k^e mod N
+    
+    Parameters:
+      vote : the real vote (1-10)
+      k    : masking factor (coprime with N)
+    
+    Returns:
+      m' : masked vote (sent to admin — admin cannot see real vote!)
+    
+    Example (Exercise 2):
+      vote=7, k=8, e=27, N=55
+      m' = 7 * 8^27 mod 55 = 14
+    """
+    if gcd(k, N) != 1:
+        raise ValueError(f"k={k} must be coprime with N={N}!")
+    if not (0 < vote < N):
+        raise ValueError(f"vote={vote} must be between 1 and {N-1}!")
+
+    m_prime = (vote * pow(k, e, N)) % N
+
+    print(f"[VOTER]  🎭 Masking vote:")
+    print(f"         vote={vote}, k={k}, e={e}, N={N}")
+    print(f"         m' = {vote} × {k}^{e} mod {N} = {m_prime}")
+    print(f"         Sending m'={m_prime} to admin (admin cannot see vote={vote}!)")
+
+    return m_prime
 
 
-def admin_menu():
-    while True:
-        keys_exist = os.path.exists(KEY_FILE)
-        print("\n" + "=" * 55)
-        print("  ADMIN — Electronic Voting System")
-        print("=" * 55)
-        print(f"  RSA Keys : {'✅ Generated' if keys_exist else '❌ Not generated yet'}")
-        print("=" * 55)
-        print("  1. Generate RSA keys (do this FIRST)")
-        print("  2. Show public key")
-        print("  3. Exit")
-        print("=" * 55)
+def unmask_signature(m_double_prime: int, k: int) -> int:
+    """
+    VOTER: Unmask the signature received from admin.
+    
+    Formula: s = m'' × k^(-1) mod N
+    
+    This gives a valid RSA signature of the vote:
+      s^e mod N == vote  ✅
+    
+    PROOF (Exercise 1):
+      s = m'' × k^(-1) mod N
+        = (m')^d × k^(-1) mod N
+        = (vote × k^e)^d × k^(-1) mod N
+        = vote^d × k^(e×d) × k^(-1) mod N
+        = vote^d × k^1 × k^(-1) mod N   (since e×d ≡ 1 mod φ(N))
+        = vote^d mod N
+      → s IS the standard RSA signature of vote! ✅
+    
+    Parameters:
+      m_double_prime : masked signature received from admin (m'')
+      k              : same masking factor used in mask_vote()
+    
+    Returns:
+      s : the real RSA signature of the vote
+    """
+    k_inv = mod_inverse(k, N)
+    s     = (m_double_prime * k_inv) % N
 
-        choice = input("Choose: ").strip()
+    print(f"[VOTER]  🔓 Unmasking signature:")
+    print(f"         m''={m_double_prime}, k^(-1)={k_inv}, N={N}")
+    print(f"         s = {m_double_prime} × {k_inv} mod {N} = {s}")
 
-        if choice == "1":
-            if keys_exist:
-                confirm = input("  Keys already exist. Regenerate? (yes/no): ").strip().lower()
-                if confirm != "yes":
-                    continue
-            generate_and_save_keys()
+    return s
 
-        elif choice == "2":
-            if not keys_exist:
-                print("\n  ❌ No keys yet. Run option 1 first.")
-                continue
-            _, public_key = load_keys()
-            pem = public_key.public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo
-            ).decode()
-            print("\n  PUBLIC KEY (safe to share):")
-            print(pem)
 
-        elif choice == "3":
-            print("  Goodbye!")
-            break
-        else:
-            print("  ❌ Invalid choice.")
+# ══════════════════════════════════════════════════════════
+#   ADMIN SIDE — Blind Signing
+# ══════════════════════════════════════════════════════════
+
+def blind_sign(m_prime: int) -> int:
+    """
+    ADMIN: Sign the masked vote WITHOUT seeing the real vote.
+    
+    Formula: m'' = (m')^d mod N
+    
+    Admin receives m' (just a number).
+    Admin does NOT know the real vote!
+    Admin signs anyway.
+    
+    Parameters:
+      m_prime : masked vote received from voter
+    
+    Returns:
+      m'' : masked signature (sent back to voter)
+    
+    Example (Exercise 2):
+      m'=14, d=3, N=55
+      m'' = 14^3 mod 55 = 2744 mod 55 = 49
+    """
+    if not (0 <= m_prime < N):
+        raise ValueError(f"m'={m_prime} must be between 0 and {N-1}!")
+
+    m_double_prime = pow(m_prime, d, N)
+
+    print(f"[ADMIN]  ✍️  Blind signing:")
+    print(f"         Received m'={m_prime} (admin does NOT see the real vote!)")
+    print(f"         m'' = {m_prime}^{d} mod {N} = {m_double_prime}")
+    print(f"         Returning m''={m_double_prime} to voter")
+
+    return m_double_prime
+
+
+# ══════════════════════════════════════════════════════════
+#   VERIFICATION — Used by counter during counting
+# ══════════════════════════════════════════════════════════
+
+def verify_signature(vote: int, s: int) -> bool:
+    """
+    Verify that s is a valid RSA signature of vote.
+    
+    Check: s^e mod N == vote
+    
+    This is the standard RSA signature verification.
+    Called by counter.py during counting.
+    
+    Parameters:
+      vote : the claimed vote value
+      s    : the signature to verify
+    
+    Returns:
+      True  → signature is valid ✅
+      False → signature is invalid ❌
+    
+    Example (Exercise 1 proof):
+      s=13, e=27, N=55, vote=7
+      13^27 mod 55 = 7 == vote ✅
+    """
+    check = pow(s, e, N)
+    valid = (check == vote % N)
+
+    if valid:
+        print(f"[ADMIN]  ✅ Signature valid: {s}^{e} mod {N} = {check} == {vote}")
+    else:
+        print(f"[ADMIN]  ❌ Signature INVALID: {s}^{e} mod {N} = {check} ≠ {vote}")
+
+    return valid
+
+
+# ══════════════════════════════════════════════════════════
+#   COMPLETE DEMO — Shows full blind signature flow
+# ══════════════════════════════════════════════════════════
+
+def demo_blind_signature(vote: int, k: int):
+    """
+    Full demonstration of the blind signature protocol.
+    Shows every step clearly.
+    """
+    print("\n" + "=" * 55)
+    print(f"  BLIND SIGNATURE DEMO")
+    print(f"  N={N}, e={e}, d={d}")
+    print(f"  vote={vote}, k={k}")
+    print("=" * 55)
+
+    # VOTER: mask
+    print("\n── STEP 1: VOTER masks the vote ──")
+    m_prime = mask_vote(vote, k)
+
+    # ADMIN: blind sign
+    print("\n── STEP 2: ADMIN signs blindly ──")
+    m_double_prime = blind_sign(m_prime)
+
+    # VOTER: unmask
+    print("\n── STEP 3: VOTER unmasks signature ──")
+    s = unmask_signature(m_double_prime, k)
+
+    # VERIFY
+    print("\n── STEP 4: VERIFY signature ──")
+    valid = verify_signature(vote, s)
+
+    # SUMMARY
+    print("\n" + "=" * 55)
+    print("  SUMMARY")
+    print("=" * 55)
+    print(f"  Real vote      = {vote}  (admin NEVER saw this!)")
+    print(f"  Masked vote m' = {m_prime}  (what admin saw)")
+    print(f"  Masked sig m'' = {m_double_prime}")
+    print(f"  Final sig  s   = {s}")
+    print(f"  Verify s^e mod N = {pow(s,e,N)} == {vote} → {'✅ VALID' if valid else '❌ INVALID'}")
+    print("=" * 55)
+
+    return s, valid
 
 
 if __name__ == "__main__":
-    admin_menu()
+    # Reproduce Exercise 2 from the project
+    print("Exercise 2: N=55, e=27, d=3")
+    print(f"Verify d: e×d mod φ(N) = {e}×{d} mod 40 = {(e*d) % 40} (should be 1) ✅")
+
+    # Test with vote=7, k=8 (as in exercise)
+    demo_blind_signature(vote=7, k=8)
